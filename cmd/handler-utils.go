@@ -26,18 +26,19 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 const (
 	copyDirective    = "COPY"
 	replaceDirective = "REPLACE"
+	accessDirective  = "ACCESS"
 )
 
 // Parses location constraint from the incoming reader.
@@ -48,13 +49,13 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
 	if err != nil && r.ContentLength != 0 {
-		logger.LogIf(GlobalContext, err)
+		internalLogOnceIf(GlobalContext, err, "location-constraint-xml-parsing")
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
 	location = locationConstraint.Location
 	if location == "" {
-		location = globalSite.Region
+		location = globalSite.Region()
 	}
 	if !isValidLocation(location) {
 		return location, ErrInvalidRegion
@@ -66,7 +67,8 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 // Validates input location is same as configured region
 // of MinIO server.
 func isValidLocation(location string) bool {
-	return globalSite.Region == "" || globalSite.Region == location
+	region := globalSite.Region()
+	return region == "" || region == location
 }
 
 // Supported headers that needs to be extracted.
@@ -81,6 +83,33 @@ var supportedHeaders = []string{
 	xhttp.AmzObjectTagging,
 	"expires",
 	xhttp.AmzBucketReplicationStatus,
+	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Replication-Server-Side-Encryption-Iv",
+	"X-Minio-Replication-Encrypted-Multipart",
+	"X-Minio-Replication-Actual-Object-Size",
+	ReplicationSsecChecksumHeader,
+	// Add more supported headers here.
+}
+
+// mapping of internal headers to allowed replication headers
+var validSSEReplicationHeaders = map[string]string{
+	"X-Minio-Internal-Server-Side-Encryption-Sealed-Key":     "X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm": "X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Internal-Server-Side-Encryption-Iv":             "X-Minio-Replication-Server-Side-Encryption-Iv",
+	"X-Minio-Internal-Encrypted-Multipart":                   "X-Minio-Replication-Encrypted-Multipart",
+	"X-Minio-Internal-Actual-Object-Size":                    "X-Minio-Replication-Actual-Object-Size",
+	// Add more supported headers here.
+}
+
+// mapping of replication headers to internal headers
+var replicationToInternalHeaders = map[string]string{
+	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key":     "X-Minio-Internal-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm": "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Replication-Server-Side-Encryption-Iv":             "X-Minio-Internal-Server-Side-Encryption-Iv",
+	"X-Minio-Replication-Encrypted-Multipart":                   "X-Minio-Internal-Encrypted-Multipart",
+	"X-Minio-Replication-Actual-Object-Size":                    "X-Minio-Internal-Actual-Object-Size",
+	ReplicationSsecChecksumHeader:                               ReplicationSsecChecksumHeader,
 	// Add more supported headers here.
 }
 
@@ -110,21 +139,20 @@ var userMetadataKeyPrefixes = []string{
 	"x-minio-meta-",
 }
 
-// extractMetadata extracts metadata from HTTP header and HTTP queryString.
-func extractMetadata(ctx context.Context, r *http.Request) (metadata map[string]string, err error) {
-	query := r.Form
-	header := r.Header
-	metadata = make(map[string]string)
-	// Extract all query values.
-	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(query), metadata)
-	if err != nil {
-		return nil, err
-	}
+// extractMetadataFromReq extracts metadata from HTTP header and HTTP queryString.
+func extractMetadataFromReq(ctx context.Context, r *http.Request) (metadata map[string]string, err error) {
+	return extractMetadata(ctx, textproto.MIMEHeader(r.Form), textproto.MIMEHeader(r.Header))
+}
 
-	// Extract all header values.
-	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(header), metadata)
-	if err != nil {
-		return nil, err
+func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (metadata map[string]string, err error) {
+	metadata = make(map[string]string)
+
+	for _, hdr := range mimesHeader {
+		// Extract all query values.
+		err = extractMetadataFromMime(ctx, hdr, metadata)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Set content-type to default value if it is not set.
@@ -164,7 +192,7 @@ func extractMetadata(ctx context.Context, r *http.Request) (metadata map[string]
 // extractMetadata extracts metadata from map values.
 func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
 	if v == nil {
-		logger.LogIf(ctx, errInvalidArgument)
+		bugLogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
 	}
 
@@ -178,13 +206,17 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 	for _, supportedHeader := range supportedHeaders {
 		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
 		if ok {
-			m[supportedHeader] = strings.Join(value, ",")
+			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
+				m[v] = strings.Join(value, ",")
+			} else {
+				m[supportedHeader] = strings.Join(value, ",")
+			}
 		}
 	}
 
 	for key := range v {
 		for _, prefix := range userMetadataKeyPrefixes {
-			if !strings.HasPrefix(strings.ToLower(key), strings.ToLower(prefix)) {
+			if !stringsHasPrefixFold(key, prefix) {
 				continue
 			}
 			value, ok := nv[http.CanonicalHeaderKey(key)]
@@ -206,13 +238,13 @@ func getReqAccessCred(r *http.Request, region string) (cred auth.Credentials) {
 	return cred
 }
 
-// Extract request params to be sent with event notifiation.
+// Extract request params to be sent with event notification.
 func extractReqParams(r *http.Request) map[string]string {
 	if r == nil {
 		return nil
 	}
 
-	region := globalSite.Region
+	region := globalSite.Region()
 	cred := getReqAccessCred(r, region)
 
 	principalID := cred.AccessKey
@@ -237,7 +269,7 @@ func extractReqParams(r *http.Request) map[string]string {
 	return m
 }
 
-// Extract response elements to be sent with event notifiation.
+// Extract response elements to be sent with event notification.
 func extractRespElements(w http.ResponseWriter) map[string]string {
 	if w == nil {
 		return map[string]string{}
@@ -267,48 +299,55 @@ func trimAwsChunkedContentEncoding(contentEnc string) (trimmedContentEnc string)
 	return strings.Join(newEncs, ",")
 }
 
-func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
+func collectInternodeStats(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		globalHTTPStats.currentS3Requests.Inc(api)
-		defer globalHTTPStats.currentS3Requests.Dec(api)
-
 		f.ServeHTTP(w, r)
 
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
-		if !ok {
+		if !ok || tc == nil {
 			return
 		}
 
+		globalConnStats.incInternodeInputBytes(int64(tc.RequestRecorder.Size()))
+		globalConnStats.incInternodeOutputBytes(int64(tc.ResponseRecorder.Size()))
+	}
+}
+
+func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
+		if err != nil {
+			defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+
+			apiErr := errorCodes.ToAPIErr(ErrUnsupportedHostHeader)
+			apiErr.Description = fmt.Sprintf("%s: %v", apiErr.Description, err)
+
+			writeErrorResponse(r.Context(), w, apiErr, r.URL)
+			return
+		}
+
+		bucket, _ := path2BucketObject(resource)
+
+		meta, err := globalBucketMetadataSys.Get(bucket) // check if this bucket exists.
+		countBktStat := bucket != "" && bucket != minioReservedBucket && err == nil && !meta.Created.IsZero()
+		if countBktStat {
+			globalBucketHTTPStats.updateHTTPStats(bucket, api, nil)
+		}
+
+		globalHTTPStats.currentS3Requests.Inc(api)
+		f.ServeHTTP(w, r)
+		globalHTTPStats.currentS3Requests.Dec(api)
+
+		tc, _ := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 		if tc != nil {
-			if strings.HasPrefix(r.URL.Path, storageRESTPrefix) ||
-				strings.HasPrefix(r.URL.Path, peerRESTPrefix) ||
-				strings.HasPrefix(r.URL.Path, peerS3Prefix) ||
-				strings.HasPrefix(r.URL.Path, lockRESTPrefix) {
-				globalConnStats.incInputBytes(int64(tc.RequestRecorder.Size()))
-				globalConnStats.incOutputBytes(int64(tc.ResponseRecorder.Size()))
-				return
-			}
-
-			if strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
-				globalConnStats.incAdminInputBytes(int64(tc.RequestRecorder.Size()))
-				globalConnStats.incAdminOutputBytes(int64(tc.ResponseRecorder.Size()))
-				return
-			}
-
 			globalHTTPStats.updateStats(api, tc.ResponseRecorder)
 			globalConnStats.incS3InputBytes(int64(tc.RequestRecorder.Size()))
 			globalConnStats.incS3OutputBytes(int64(tc.ResponseRecorder.Size()))
 
-			resource, err := getResource(r.URL.Path, r.Host, globalDomainNames)
-			if err != nil {
-				logger.LogIf(r.Context(), fmt.Errorf("Unable to get the actual resource in the incoming request: %v", err))
-				return
-			}
-
-			bucket, _ := path2BucketObject(resource)
-			if bucket != "" && bucket != minioReservedBucket {
+			if countBktStat {
 				globalBucketConnStats.incS3InputBytes(bucket, int64(tc.RequestRecorder.Size()))
 				globalBucketConnStats.incS3OutputBytes(bucket, int64(tc.ResponseRecorder.Size()))
+				globalBucketHTTPStats.updateHTTPStats(bucket, api, tc.ResponseRecorder)
 			}
 		}
 	}
@@ -359,12 +398,6 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	desc := "Do not upgrade one server at a time - please follow the recommended guidelines mentioned here https://github.com/minio/minio#upgrading-minio for your environment"
 	switch {
-	case strings.HasPrefix(r.URL.Path, peerS3Prefix):
-		writeErrorResponseString(r.Context(), w, APIError{
-			Code:           "XMinioPeerS3VersionMismatch",
-			Description:    desc,
-			HTTPStatusCode: http.StatusUpgradeRequired,
-		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioPeerVersionMismatch",
@@ -374,12 +407,6 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, storageRESTPrefix):
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioStorageVersionMismatch",
-			Description:    desc,
-			HTTPStatusCode: http.StatusUpgradeRequired,
-		}, r.URL)
-	case strings.HasPrefix(r.URL.Path, lockRESTPrefix):
-		writeErrorResponseString(r.Context(), w, APIError{
-			Code:           "XMinioLockVersionMismatch",
 			Description:    desc,
 			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
@@ -435,7 +462,7 @@ func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, e
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			success = false
 			if err != nil && !errors.Is(err, context.Canceled) {
-				logger.LogIf(GlobalContext, err)
+				replLogIf(GlobalContext, err)
 			}
 		},
 	})

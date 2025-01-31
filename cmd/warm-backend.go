@@ -18,13 +18,13 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -38,6 +38,7 @@ type WarmBackendGetOpts struct {
 // WarmBackend provides interface to be implemented by remote tier backends
 type WarmBackend interface {
 	Put(ctx context.Context, object string, r io.Reader, length int64) (remoteVersionID, error)
+	PutWithMeta(ctx context.Context, object string, r io.Reader, length int64, meta map[string]string) (remoteVersionID, error)
 	Get(ctx context.Context, object string, rv remoteVersionID, opts WarmBackendGetOpts) (io.ReadCloser, error)
 	Remove(ctx context.Context, object string, rv remoteVersionID) error
 	InUse(ctx context.Context) (bool, error)
@@ -48,8 +49,7 @@ const probeObject = "probeobject"
 // checkWarmBackend checks if tier config credentials have sufficient privileges
 // to perform all operations defined in the WarmBackend interface.
 func checkWarmBackend(ctx context.Context, w WarmBackend) error {
-	var empty bytes.Reader
-	rv, err := w.Put(ctx, probeObject, &empty, 0)
+	remoteVersionID, err := w.Put(ctx, probeObject, strings.NewReader("MinIO"), 5)
 	if err != nil {
 		if _, ok := err.(BackendDown); ok {
 			return err
@@ -60,7 +60,7 @@ func checkWarmBackend(ctx context.Context, w WarmBackend) error {
 		}
 	}
 
-	r, err := w.Get(ctx, probeObject, rv, WarmBackendGetOpts{})
+	r, err := w.Get(ctx, probeObject, "", WarmBackendGetOpts{})
 	xhttp.DrainBody(r)
 	if err != nil {
 		if _, ok := err.(BackendDown); ok {
@@ -78,7 +78,7 @@ func checkWarmBackend(ctx context.Context, w WarmBackend) error {
 			}
 		}
 	}
-	if err = w.Remove(ctx, probeObject, rv); err != nil {
+	if err = w.Remove(ctx, probeObject, remoteVersionID); err != nil {
 		if _, ok := err.(BackendDown); ok {
 			return err
 		}
@@ -117,7 +117,7 @@ type tierPermErr struct {
 }
 
 func (te tierPermErr) Error() string {
-	return fmt.Sprintf("failed to perform %s %v", te.Op, te.Err)
+	return fmt.Sprintf("failed to perform %s: %v", te.Op, te.Err)
 }
 
 func errIsTierPermError(err error) bool {
@@ -131,7 +131,7 @@ type remoteVersionID string
 
 // newWarmBackend instantiates the tier type specific WarmBackend, runs
 // checkWarmBackend on it.
-func newWarmBackend(ctx context.Context, tier madmin.TierConfig) (d WarmBackend, err error) {
+func newWarmBackend(ctx context.Context, tier madmin.TierConfig, probe bool) (d WarmBackend, err error) {
 	switch tier.Type {
 	case madmin.S3:
 		d, err = newWarmBackendS3(*tier.S3, tier.Name)
@@ -145,12 +145,15 @@ func newWarmBackend(ctx context.Context, tier madmin.TierConfig) (d WarmBackend,
 		return nil, errTierTypeUnsupported
 	}
 	if err != nil {
-		return nil, errTierTypeUnsupported
+		tierLogIf(ctx, err)
+		return nil, errTierInvalidConfig
 	}
 
-	err = checkWarmBackend(ctx, d)
-	if err != nil {
-		return nil, err
+	if probe {
+		if err = checkWarmBackend(ctx, d); err != nil {
+			return nil, err
+		}
 	}
+
 	return d, nil
 }

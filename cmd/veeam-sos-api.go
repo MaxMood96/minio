@@ -22,6 +22,11 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"os"
+	"strings"
+
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/logger"
 )
 
 // From Veeam-SOSAPI_1.0_Document_v1.02d.pdf
@@ -81,6 +86,11 @@ type apiEndpoints struct {
 	STSEndpoint string `xml:"STSEndpoint"`
 }
 
+// globalVeeamForceSC is set by the environment variable _MINIO_VEEAM_FORCE_SC
+// This will override the storage class returned by the storage backend if it is non-standard
+// and we detect a Veeam client by checking the User Agent.
+var globalVeeamForceSC = os.Getenv("_MINIO_VEEAM_FORCE_SC")
+
 type systemInfo struct {
 	XMLName              xml.Name `xml:"SystemInfo" json:"-"`
 	ProtocolVersion      string   `xml:"ProtocolVersion"`
@@ -113,7 +123,32 @@ type capacityInfo struct {
 const (
 	systemXMLObject   = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml"
 	capacityXMLObject = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/capacity.xml"
+	veeamAgentSubstr  = "APN/1.0 Veeam/1.0"
 )
+
+func isVeeamSOSAPIObject(object string) bool {
+	switch object {
+	case systemXMLObject, capacityXMLObject:
+		return true
+	default:
+		return false
+	}
+}
+
+// isVeeamClient - returns true if the request is from Veeam client.
+func isVeeamClient(ctx context.Context) bool {
+	ri := logger.GetReqInfo(ctx)
+	return ri != nil && strings.Contains(ri.UserAgent, veeamAgentSubstr)
+}
+
+func veeamSOSAPIHeadObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+	gr, err := veeamSOSAPIGetObject(ctx, bucket, object, nil, opts)
+	if gr != nil {
+		gr.Close()
+		return gr.ObjInfo, nil
+	}
+	return ObjectInfo{}, err
+}
 
 func veeamSOSAPIGetObject(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	var buf []byte
@@ -134,17 +169,32 @@ func veeamSOSAPIGetObject(ctx context.Context, bucket, object string, rs *HTTPRa
 		if objAPI == nil {
 			return nil, errServerNotInitialized
 		}
-		info := objAPI.StorageInfo(ctx)
-		info.Backend = objAPI.BackendInfo()
 
-		usableTotal := int64(GetTotalUsableCapacity(info.Disks, info))
-		usableFree := int64(GetTotalUsableCapacityFree(info.Disks, info))
+		q, _ := globalBucketQuotaSys.Get(ctx, bucket)
+		binfo := globalBucketQuotaSys.GetBucketUsageInfo(ctx, bucket)
 
 		ci := capacityInfo{
-			Capacity:  usableTotal,
-			Available: usableFree,
-			Used:      usableTotal - usableFree,
+			Used: int64(binfo.Size),
 		}
+
+		var quotaSize int64
+		if q != nil && q.Type == madmin.HardQuota {
+			if q.Size > 0 {
+				quotaSize = int64(q.Size)
+			} else if q.Quota > 0 {
+				quotaSize = int64(q.Quota)
+			}
+		}
+
+		if quotaSize == 0 {
+			info := objAPI.StorageInfo(ctx, true)
+			info.Backend = objAPI.BackendInfo()
+
+			ci.Capacity = int64(GetTotalUsableCapacity(info.Disks, info))
+		} else {
+			ci.Capacity = quotaSize
+		}
+		ci.Available = ci.Capacity - ci.Used
 
 		buf = encodeResponse(&ci)
 	default:

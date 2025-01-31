@@ -22,15 +22,17 @@ import (
 	"net"
 	"net/http"
 	"path"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/grid"
+	xnet "github.com/minio/pkg/v3/net"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
@@ -71,7 +73,10 @@ const (
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
-		if strings.HasPrefix(strings.ToLower(key), ReservedMetadataPrefixLower) {
+		if _, ok := validSSEReplicationHeaders[key]; ok {
+			return false
+		}
+		if stringsHasPrefixFold(key, ReservedMetadataPrefix) {
 			return true
 		}
 	}
@@ -87,7 +92,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 		length := len(key) + len(header.Get(key))
 		size += length
 		for _, prefix := range userMetadataKeyPrefixes {
-			if strings.HasPrefix(strings.ToLower(key), prefix) {
+			if stringsHasPrefixFold(key, prefix) {
 				usersize += length
 				break
 			}
@@ -100,7 +105,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 }
 
 // Limits body and header to specific allowed maximum limits as per S3/MinIO API requirements.
-func setRequestLimitHandler(h http.Handler) http.Handler {
+func setRequestLimitMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 
@@ -147,11 +152,11 @@ func guessIsBrowserReq(r *http.Request) bool {
 		globalBrowserEnabled && aType == authTypeAnonymous
 }
 
-func setBrowserRedirectHandler(h http.Handler) http.Handler {
+func setBrowserRedirectMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		read := r.Method == http.MethodGet || r.Method == http.MethodHead
 		// Re-direction is handled specifically for browser requests.
-		if guessIsBrowserReq(r) && read {
+		if !guessIsHealthCheckReq(r) && guessIsBrowserReq(r) && read && globalBrowserRedirect {
 			// Fetch the redirect location if any.
 			if u := getRedirectLocation(r); u != nil {
 				// Employ a temporary re-direct.
@@ -206,7 +211,7 @@ func getRedirectLocation(r *http.Request) *xnet.URL {
 }
 
 // guessIsHealthCheckReq - returns true if incoming request looks
-// like healthcheck request
+// like healthCheck request
 func guessIsHealthCheckReq(req *http.Request) bool {
 	if req == nil {
 		return false
@@ -229,7 +234,10 @@ func guessIsMetricsReq(req *http.Request) bool {
 	return (aType == authTypeAnonymous || aType == authTypeJWT) &&
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsPathLegacy ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ClusterPath ||
-		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2BucketPath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ResourcePath ||
+		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+metricsV3Path)
 }
 
 // guessIsRPCReq - returns true if the request is for an RPC endpoint.
@@ -237,7 +245,14 @@ func guessIsRPCReq(req *http.Request) bool {
 	if req == nil {
 		return false
 	}
-	return req.Method == http.MethodPost &&
+	if req.Method == http.MethodGet && req.URL != nil {
+		switch req.URL.Path {
+		case grid.RoutePath, grid.RouteLockPath:
+			return true
+		}
+	}
+
+	return (req.Method == http.MethodPost || req.Method == http.MethodGet) &&
 		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+SlashSeparator)
 }
 
@@ -255,7 +270,7 @@ func isKMSReq(r *http.Request) bool {
 
 // Supported Amz date headers.
 var amzDateHeaders = []string{
-	// Do not chane this order, x-amz-date value should be
+	// Do not change this order, x-amz-date value should be
 	// validated first.
 	"x-amz-date",
 	"date",
@@ -278,12 +293,6 @@ func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	return time.Time{}, ErrMissingDateHeader
 }
 
-// Bad path components to be rejected by the path validity handler.
-const (
-	dotdotComponent = ".."
-	dotComponent    = "."
-)
-
 func hasBadHost(host string) error {
 	if globalIsCICD && strings.TrimSpace(host) == "" {
 		// under CI/CD test setups ignore empty hosts as invalid hosts
@@ -296,14 +305,41 @@ func hasBadHost(host string) error {
 // Check if the incoming path has bad path components,
 // such as ".." and "."
 func hasBadPathComponent(path string) bool {
-	path = filepath.ToSlash(strings.TrimSpace(path)) // For windows '\' must be converted to '/'
-	for _, p := range strings.Split(path, SlashSeparator) {
-		switch strings.TrimSpace(p) {
-		case dotdotComponent:
+	n := len(path)
+	if n > 32<<10 {
+		// At 32K we are beyond reasonable.
+		return true
+	}
+	i := 0
+	// Skip leading slashes (for sake of Windows \ is included as well)
+	for i < n && (path[i] == SlashSeparatorChar || path[i] == '\\') {
+		i++
+	}
+
+	for i < n {
+		// Find the next segment
+		start := i
+		for i < n && path[i] != SlashSeparatorChar && path[i] != '\\' {
+			i++
+		}
+
+		// Trim whitespace of segment
+		segmentStart, segmentEnd := start, i
+		for segmentStart < segmentEnd && unicode.IsSpace(rune(path[segmentStart])) {
+			segmentStart++
+		}
+		for segmentEnd > segmentStart && unicode.IsSpace(rune(path[segmentEnd-1])) {
+			segmentEnd--
+		}
+
+		// Check for ".." or "."
+		switch {
+		case segmentEnd-segmentStart == 2 && path[segmentStart] == '.' && path[segmentStart+1] == '.':
 			return true
-		case dotComponent:
+		case segmentEnd-segmentStart == 1 && path[segmentStart] == '.':
 			return true
 		}
+		i++
 	}
 	return false
 }
@@ -325,7 +361,7 @@ func hasMultipleAuth(r *http.Request) bool {
 
 // requestValidityHandler validates all the incoming paths for
 // any malicious requests.
-func setRequestValidityHandler(h http.Handler) http.Handler {
+func setRequestValidityMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 
@@ -356,7 +392,10 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 			return
 		}
 		// Check for bad components in URL query values.
-		for _, vv := range r.Form {
+		for k, vv := range r.Form {
+			if k == "delimiter" { // delimiters are allowed to have `.` or `..`
+				continue
+			}
 			for _, v := range vv {
 				if hasBadPathComponent(v) {
 					if ok {
@@ -396,6 +435,17 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrAllAccessDisabled), r.URL)
 				return
 			}
+		} else {
+			// Validate bucket names if it is not empty
+			if bucketName != "" && s3utils.CheckValidBucketNameStrict(bucketName) != nil {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = true
+				}
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidBucketName), r.URL)
+				return
+			}
 		}
 		// Deny SSE-C requests if not made over TLS
 		if !globalIsTLS && (crypto.SSEC.IsRequested(r.Header) || crypto.SSECopy.IsRequested(r.Header)) {
@@ -422,14 +472,19 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 	})
 }
 
-// setBucketForwardingHandler middleware forwards the path style requests
+// setBucketForwardingMiddleware middleware forwards the path style requests
 // on a bucket to the right bucket location, bucket to IP configuration
 // is obtained from centralized etcd configuration service.
-func setBucketForwardingHandler(h http.Handler) http.Handler {
+func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := w.Header().Get("Access-Control-Allow-Origin"); origin == "null" {
+			// This is a workaround change to ensure that "Origin: null"
+			// incoming request to a response back as "*" instead of "null"
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
-			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) || isKMSReq(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -490,13 +545,12 @@ func setBucketForwardingHandler(h http.Handler) http.Handler {
 	})
 }
 
-// addCustomHeaders adds various HTTP(S) response headers.
+// addCustomHeadersMiddleware adds various HTTP(S) response headers.
 // Security Headers enable various security protections behaviors in the client's browser.
-func addCustomHeaders(h http.Handler) http.Handler {
+func addCustomHeadersMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
 		header.Set("X-XSS-Protection", "1; mode=block")                                // Prevents against XSS attacks
-		header.Set("Content-Security-Policy", "block-all-mixed-content")               // prevent mixed (HTTP / HTTPS content)
 		header.Set("X-Content-Type-Options", "nosniff")                                // Prevent mime-sniff
 		header.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains") // HSTS mitigates variants of MITM attacks
 
@@ -537,9 +591,9 @@ func setCriticalErrorHandler(h http.Handler) http.Handler {
 	})
 }
 
-// setUploadForwardingHandler middleware forwards multiparts requests
+// setUploadForwardingMiddleware middleware forwards multiparts requests
 // in a site replication setup to peer that initiated the upload
-func setUploadForwardingHandler(h http.Handler) http.Handler {
+func setUploadForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !globalSiteReplicationSys.isEnabled() ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
@@ -562,13 +616,6 @@ func setUploadForwardingHandler(h http.Handler) http.Handler {
 				h.ServeHTTP(w, r)
 				return
 			}
-			// forward request to peer handling this upload
-			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
-				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
-				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
-				return
-			}
-
 			r.URL.Scheme = remote.EndpointURL.Scheme
 			r.URL.Host = remote.EndpointURL.Host
 			// Make sure we remove any existing headers before

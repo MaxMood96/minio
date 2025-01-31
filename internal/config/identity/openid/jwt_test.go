@@ -31,12 +31,11 @@ import (
 	"testing"
 	"time"
 
-	jwtg "github.com/golang-jwt/jwt/v4"
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/config"
 	jwtm "github.com/minio/minio/internal/jwt"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 func TestUpdateClaimsExpiry(t *testing.T) {
@@ -259,8 +258,8 @@ func TestExpCorrect(t *testing.T) {
 	if err := updateClaimsExpiry("3600", claimsMap.MapClaims); err != nil {
 		t.Error(err)
 	}
-	// Build simple toke with updated expiration claim
-	token := jwtg.NewWithClaims(jwtg.SigningMethodHS256, claimsMap)
+	// Build simple token with updated expiration claim
+	token := jwtgo.NewWithClaims(jwtgo.SigningMethodHS256, claimsMap)
 	tokenString, err := token.SignedString(signKey)
 	if err != nil {
 		t.Error(err)

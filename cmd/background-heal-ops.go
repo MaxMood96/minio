@@ -24,9 +24,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/pkg/v3/env"
 )
 
 // healTask represents what to heal along with options
@@ -75,9 +74,9 @@ func waitForLowIO(maxIO int, maxWait time.Duration, currentIO func() int) {
 		if tmpMaxWait > 0 {
 			if tmpMaxWait < waitTick {
 				time.Sleep(tmpMaxWait)
-			} else {
-				time.Sleep(waitTick)
+				return
 			}
+			time.Sleep(waitTick)
 			tmpMaxWait -= waitTick
 		}
 		if tmpMaxWait <= 0 {
@@ -101,17 +100,17 @@ func waitForLowHTTPReq() {
 }
 
 func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
+	bgSeq := newBgHealSequence()
 	// Run the background healer
-	globalBackgroundHealRoutine = newHealRoutine()
 	for i := 0; i < globalBackgroundHealRoutine.workers; i++ {
-		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI)
+		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI, bgSeq)
 	}
 
-	globalBackgroundHealState.LaunchNewHealSequence(newBgHealSequence(), objAPI)
+	globalBackgroundHealState.LaunchNewHealSequence(bgSeq, objAPI)
 }
 
 // Wait for heal requests and process them
-func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
+func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer, bgSeq *healSequence) {
 	for {
 		select {
 		case task, ok := <-h.tasks:
@@ -136,8 +135,18 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 
 			if task.respCh != nil {
 				task.respCh <- healResult{result: res, err: err}
+				continue
 			}
 
+			// when respCh is not set caller is not waiting but we
+			// update the relevant metrics for them
+			if bgSeq != nil {
+				if err == nil {
+					bgSeq.countHealed(res.Type)
+				} else {
+					bgSeq.countFailed(res.Type)
+				}
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -149,7 +158,7 @@ func newHealRoutine() *healRoutine {
 
 	if envHealWorkers := env.Get("_MINIO_HEAL_WORKERS", ""); envHealWorkers != "" {
 		if numHealers, err := strconv.Atoi(envHealWorkers); err != nil {
-			logger.LogIf(context.Background(), fmt.Errorf("invalid _MINIO_HEAL_WORKERS value: %w", err))
+			bugLogIf(context.Background(), fmt.Errorf("invalid _MINIO_HEAL_WORKERS value: %w", err))
 		} else {
 			workers = numHealers
 		}

@@ -21,10 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
-	xnet "github.com/minio/pkg/net"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 const (
@@ -39,42 +40,88 @@ var ErrNotConnected = errors.New("not connected to target server/service")
 // Target - store target interface
 type Target interface {
 	Name() string
-	SendFromStore(key string) error
+	SendFromStore(key Key) error
 }
 
 // Store - Used to persist items.
 type Store[I any] interface {
-	Put(item I) error
-	Get(key string) (I, error)
+	Put(item I) (Key, error)
+	PutMultiple(item []I) (Key, error)
+	Get(key Key) (I, error)
+	GetMultiple(key Key) ([]I, error)
+	GetRaw(key Key) ([]byte, error)
+	PutRaw(b []byte) (Key, error)
 	Len() int
-	List() ([]string, error)
-	Del(key string) error
+	List() []Key
+	Del(key Key) error
 	Open() error
-	Extension() string
+	Delete() error
+}
+
+// Key denotes the key present in the store.
+type Key struct {
+	Name      string
+	Compress  bool
+	Extension string
+	ItemCount int
+}
+
+// String returns the filepath name
+func (k Key) String() string {
+	keyStr := k.Name
+	if k.ItemCount > 1 {
+		keyStr = fmt.Sprintf("%d:%s", k.ItemCount, k.Name)
+	}
+	return keyStr + k.Extension + func() string {
+		if k.Compress {
+			return compressExt
+		}
+		return ""
+	}()
+}
+
+func getItemCount(k string) (count int, err error) {
+	count = 1
+	v := strings.Split(k, ":")
+	if len(v) == 2 {
+		return strconv.Atoi(v[0])
+	}
+	return
+}
+
+func parseKey(k string) (key Key) {
+	key.Name = k
+	if strings.HasSuffix(k, compressExt) {
+		key.Compress = true
+		key.Name = strings.TrimSuffix(key.Name, compressExt)
+	}
+	if key.ItemCount, _ = getItemCount(k); key.ItemCount > 1 {
+		key.Name = strings.TrimPrefix(key.Name, fmt.Sprintf("%d:", key.ItemCount))
+	}
+	if vals := strings.Split(key.Name, "."); len(vals) == 2 {
+		key.Extension = "." + vals[1]
+		key.Name = strings.TrimSuffix(key.Name, key.Extension)
+	}
+	return
 }
 
 // replayItems - Reads the items from the store and replays.
-func replayItems[I any](store Store[I], doneCh <-chan struct{}, log logger, id string) <-chan string {
-	itemKeyCh := make(chan string)
+func replayItems[I any](store Store[I], doneCh <-chan struct{}, log logger, id string) <-chan Key {
+	keyCh := make(chan Key)
 
 	go func() {
-		defer close(itemKeyCh)
+		defer xioutil.SafeClose(keyCh)
 
 		retryTicker := time.NewTicker(retryInterval)
 		defer retryTicker.Stop()
 
 		for {
-			names, err := store.List()
-			if err != nil {
-				log(context.Background(), fmt.Errorf("store.List() failed with: %w", err), id)
-			} else {
-				for _, name := range names {
-					select {
-					case itemKeyCh <- strings.TrimSuffix(name, store.Extension()):
-					// Get next key.
-					case <-doneCh:
-						return
-					}
+			for _, key := range store.List() {
+				select {
+				case keyCh <- key:
+				// Get next key.
+				case <-doneCh:
+					return
 				}
 			}
 
@@ -86,30 +133,29 @@ func replayItems[I any](store Store[I], doneCh <-chan struct{}, log logger, id s
 		}
 	}()
 
-	return itemKeyCh
+	return keyCh
 }
 
 // sendItems - Reads items from the store and re-plays.
-func sendItems(target Target, itemKeyCh <-chan string, doneCh <-chan struct{}, logger logger) {
+func sendItems(target Target, keyCh <-chan Key, doneCh <-chan struct{}, logger logger) {
 	retryTicker := time.NewTicker(retryInterval)
 	defer retryTicker.Stop()
 
-	send := func(itemKey string) bool {
+	send := func(key Key) bool {
 		for {
-			err := target.SendFromStore(itemKey)
+			err := target.SendFromStore(key)
 			if err == nil {
 				break
 			}
 
-			if err != ErrNotConnected && !xnet.IsConnResetErr(err) {
-				logger(context.Background(),
-					fmt.Errorf("target.SendFromStore() failed with '%w'", err),
-					target.Name())
-			}
-
-			// Retrying after 3secs back-off
+			logger(
+				context.Background(),
+				fmt.Errorf("unable to send log entry to '%s' err '%w'", target.Name(), err),
+				target.Name(),
+			)
 
 			select {
+			// Retrying after 3secs back-off
 			case <-retryTicker.C:
 			case <-doneCh:
 				return false
@@ -120,13 +166,12 @@ func sendItems(target Target, itemKeyCh <-chan string, doneCh <-chan struct{}, l
 
 	for {
 		select {
-		case itemKey, ok := <-itemKeyCh:
+		case key, ok := <-keyCh:
 			if !ok {
-				// closed channel.
 				return
 			}
 
-			if !send(itemKey) {
+			if !send(key) {
 				return
 			}
 		case <-doneCh:
@@ -138,9 +183,7 @@ func sendItems(target Target, itemKeyCh <-chan string, doneCh <-chan struct{}, l
 // StreamItems reads the keys from the store and replays the corresponding item to the target.
 func StreamItems[I any](store Store[I], target Target, doneCh <-chan struct{}, logger logger) {
 	go func() {
-		// Replays the items from the store.
-		itemKeyCh := replayItems(store, doneCh, logger, target.Name())
-		// Send items from the store.
-		sendItems(target, itemKeyCh, doneCh, logger)
+		keyCh := replayItems(store, doneCh, logger, target.Name())
+		sendItems(target, keyCh, doneCh, logger)
 	}()
 }

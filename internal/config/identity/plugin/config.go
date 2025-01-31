@@ -34,9 +34,13 @@ import (
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 )
+
+func authNLogIf(ctx context.Context, err error) {
+	logger.LogIf(ctx, "authN", err)
+}
 
 // Authentication Plugin config and env variables
 const (
@@ -89,6 +93,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         RolePolicy,
@@ -196,7 +201,7 @@ func (h *metrics) accumRequestRTT(reqStartTime time.Time, rttMs float64, isSucce
 		}
 	}
 
-	// Round the reqest time *down* to whole minute.
+	// Round the request time *down* to whole minute.
 	reqTimeMinute := reqStartTime.Truncate(time.Minute)
 	if reqTimeMinute.After(h.currentMinute.statsTime) {
 		// Drop the last full minute now, since we got a request for a time we
@@ -433,7 +438,7 @@ func (o *AuthNPlugin) checkConnectivity(ctx context.Context) bool {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
 	if err != nil {
-		logger.LogIf(ctx, err)
+		authNLogIf(ctx, err)
 		return false
 	}
 

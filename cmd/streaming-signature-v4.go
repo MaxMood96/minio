@@ -106,7 +106,7 @@ func calculateSeedSignature(r *http.Request, trailers bool) (cred auth.Credentia
 	v4Auth := req.Header.Get(xhttp.Authorization)
 
 	// Parse signature version '4' header.
-	signV4Values, errCode := parseSignV4(v4Auth, globalSite.Region, serviceS3)
+	signV4Values, errCode := parseSignV4(v4Auth, globalSite.Region(), serviceS3)
 	if errCode != ErrNone {
 		return cred, "", "", time.Time{}, errCode
 	}
@@ -171,7 +171,7 @@ func calculateSeedSignature(r *http.Request, trailers bool) (cred auth.Credentia
 		return cred, "", "", time.Time{}, ErrSignatureDoesNotMatch
 	}
 
-	// Return caculated signature.
+	// Return calculated signature.
 	return cred, newSignature, region, date, ErrNone
 }
 
@@ -443,6 +443,9 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 
 // readTrailers will read all trailers and populate cr.trailers with actual values.
 func (cr *s3ChunkedReader) readTrailers() error {
+	if cr.debug {
+		fmt.Printf("pre trailer sig: %s\n", cr.seedSignature)
+	}
 	var valueBuffer bytes.Buffer
 	// Read value
 	for {
@@ -507,13 +510,23 @@ func (cr *s3ChunkedReader) readTrailers() error {
 		}
 		return errMalformedEncoding
 	}
+
+	// TODO: It seems like we may have to be prepared to rewrite and sort trailing headers:
+	// https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
+
+	// Any value must end with a newline.
+	// Not all clients send that.
+	trailerRaw := valueBuffer.Bytes()
+	if len(trailerRaw) > 0 && trailerRaw[len(trailerRaw)-1] != '\n' {
+		valueBuffer.Write([]byte{'\n'})
+	}
 	sig = sig[len("x-amz-trailer-signature:"):]
 	sig = bytes.TrimSpace(sig)
 	cr.chunkSHA256Writer.Write(valueBuffer.Bytes())
 	wantSig := cr.getTrailerChunkSignature()
 	if !compareSignatureV4(string(sig), wantSig) {
 		if cr.debug {
-			fmt.Printf("signature, want: %q, got %q\nSignature buffer: %q\n", wantSig, string(sig), string(valueBuffer.Bytes()))
+			fmt.Printf("signature, want: %q, got %q\nSignature buffer: %q\n", wantSig, string(sig), valueBuffer.String())
 		}
 		return errSignatureMismatch
 	}

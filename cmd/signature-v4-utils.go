@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -30,7 +31,7 @@ import (
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // http Header "x-amz-content-sha256" == "UNSIGNED-PAYLOAD" indicates that the
@@ -78,7 +79,7 @@ func skipContentSha256Cksum(r *http.Request) bool {
 		// We return true only in situations when
 		// deployment has asked MinIO to allow for
 		// such broken clients and content-length > 0.
-		return r.ContentLength > 0 && !globalCLIContext.StrictS3Compat
+		return r.ContentLength > 0 && !globalServerCtxt.StrictS3Compat
 	}
 	return false
 }
@@ -151,14 +152,17 @@ func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, A
 			// Check if server has initialized, then only proceed
 			// to check for IAM users otherwise its okay for clients
 			// to retry with 503 errors when server is coming up.
-			return auth.Credentials{}, false, ErrServerNotInitialized
+			return auth.Credentials{}, false, ErrIAMNotInitialized
 		}
 
 		// Check if the access key is part of users credentials.
-		u, ok := globalIAMSys.GetUser(r.Context(), accessKey)
+		u, ok, err := globalIAMSys.CheckKey(r.Context(), accessKey)
+		if err != nil {
+			return auth.Credentials{}, false, ErrIAMNotInitialized
+		}
 		if !ok {
-			// Credentials will be invalid but and disabled
-			// return a different error in such a scenario.
+			// Credentials could be valid but disabled - return a different
+			// error in such a scenario.
 			if u.Credentials.Status == auth.AccountOff {
 				return cred, false, ErrAccessKeyDisabled
 			}
@@ -179,7 +183,7 @@ func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, A
 		return cred, owner, ErrAccessKeyDisabled
 	}
 
-	if _, ok := claims[iampolicy.SessionPolicyName]; ok {
+	if _, ok := claims[policy.SessionPolicyName]; ok {
 		owner = false
 	}
 
@@ -199,13 +203,13 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 	reqQueries := r.Form
 	// find whether "host" is part of list of signed headers.
 	// if not return ErrUnsignedHeaders. "host" is mandatory.
-	if !contains(signedHeaders, "host") {
+	if !slices.Contains(signedHeaders, "host") {
 		return nil, ErrUnsignedHeaders
 	}
 	extractedSignedHeaders := make(http.Header)
 	for _, header := range signedHeaders {
 		// `host` will not be found in the headers, can be found in r.Host.
-		// but its alway necessary that the list of signed headers containing host in it.
+		// but its always necessary that the list of signed headers containing host in it.
 		val, ok := reqHeaders[http.CanonicalHeaderKey(header)]
 		if !ok {
 			// try to set headers from Query String
@@ -258,4 +262,19 @@ func signV4TrimAll(input string) string {
 	// Compress adjacent spaces (a space is determined by
 	// unicode.IsSpace() internally here) to one space and return
 	return strings.Join(strings.Fields(input), " ")
+}
+
+// checkMetaHeaders will check if the metadata from header/url is the same with the one from signed headers
+func checkMetaHeaders(signedHeadersMap http.Header, r *http.Request) APIErrorCode {
+	// check values from http header
+	for k, val := range r.Header {
+		if stringsHasPrefixFold(k, "X-Amz-Meta-") {
+			if signedHeadersMap.Get(k) == val[0] {
+				continue
+			}
+			return ErrUnsignedHeaders
+		}
+	}
+
+	return ErrNone
 }

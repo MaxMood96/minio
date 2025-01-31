@@ -24,26 +24,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/pkg/logger/message/audit"
+	"github.com/IBM/sarama"
+	saramatls "github.com/IBM/sarama/tools/tls"
 
-	"github.com/Shopify/sarama"
-	saramatls "github.com/Shopify/sarama/tools/tls"
-
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // the suffix for the configured queue dir where the logs will be persisted.
 const kafkaLoggerExtension = ".kafka.log"
+
+const (
+	statusClosed = iota
+	statusOffline
+	statusOnline
+)
 
 // Config - kafka target arguments.
 type Config struct {
@@ -73,37 +78,30 @@ type Config struct {
 	LogOnce func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
 }
 
-// Check if atleast one broker in cluster is active
-func (k Config) pingBrokers() (err error) {
-	d := net.Dialer{Timeout: 60 * time.Second}
-
-	for _, broker := range k.Brokers {
-		_, err = d.Dial("tcp", broker.String())
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Target - Kafka target.
 type Target struct {
+	status int32
+
 	totalMessages  int64
 	failedMessages int64
 
-	wg     sync.WaitGroup
-	doneCh chan struct{}
+	wg sync.WaitGroup
 
-	// Channel of log entries
-	logCh chan audit.Entry
+	// Channel of log entries.
+	// Reading logCh must hold read lock on logChMu (to avoid read race)
+	// Sending a value on logCh must hold read lock on logChMu (to avoid closing)
+	logCh   chan interface{}
+	logChMu sync.RWMutex
 
 	// store to persist and replay the logs to the target
 	// to avoid missing events when the target is down.
-	store              store.Store[audit.Entry]
-	storeCtxCancel     context.CancelFunc
+	store          store.Store[interface{}]
+	storeCtxCancel context.CancelFunc
+
 	initKafkaOnce      once.Init
 	initQueueStoreOnce once.Init
 
+	client   sarama.Client
 	producer sarama.SyncProducer
 	kconfig  Config
 	config   *sarama.Config
@@ -138,10 +136,14 @@ func (h *Target) String() string {
 
 // Stats returns the target statistics.
 func (h *Target) Stats() types.TargetStats {
+	h.logChMu.RLock()
+	queueLength := len(h.logCh)
+	h.logChMu.RUnlock()
+
 	return types.TargetStats{
 		TotalMessages:  atomic.LoadInt64(&h.totalMessages),
 		FailedMessages: atomic.LoadInt64(&h.failedMessages),
-		QueueLength:    len(h.logCh),
+		QueueLength:    queueLength,
 	}
 }
 
@@ -162,14 +164,13 @@ func (h *Target) Init(ctx context.Context) error {
 	if err := h.init(); err != nil {
 		return err
 	}
-	go h.startKakfaLogger()
+	go h.startKafkaLogger()
 	return nil
 }
 
 func (h *Target) initQueueStore(ctx context.Context) (err error) {
-	var queueStore store.Store[audit.Entry]
 	queueDir := filepath.Join(h.kconfig.QueueDir, h.Name())
-	queueStore = store.NewQueueStore[audit.Entry](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
+	queueStore := store.NewQueueStore[interface{}](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
 	if err = queueStore.Open(); err != nil {
 		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
 	}
@@ -180,25 +181,29 @@ func (h *Target) initQueueStore(ctx context.Context) (err error) {
 	return
 }
 
-func (h *Target) startKakfaLogger() {
-	// Create a routine which sends json logs received
-	// from an internal channel.
-	h.wg.Add(1)
-	go func() {
+func (h *Target) startKafkaLogger() {
+	h.logChMu.RLock()
+	logCh := h.logCh
+	if logCh != nil {
+		// We are not allowed to add when logCh is nil
+		h.wg.Add(1)
 		defer h.wg.Done()
 
-		for {
-			select {
-			case entry := <-h.logCh:
-				h.logEntry(entry)
-			case <-h.doneCh:
-				return
-			}
-		}
-	}()
+	}
+	h.logChMu.RUnlock()
+
+	if logCh == nil {
+		return
+	}
+
+	// Create a routine which sends json logs received
+	// from an internal channel.
+	for entry := range logCh {
+		h.logEntry(entry)
+	}
 }
 
-func (h *Target) logEntry(entry audit.Entry) {
+func (h *Target) logEntry(entry interface{}) {
 	atomic.AddInt64(&h.totalMessages, 1)
 	if err := h.send(entry); err != nil {
 		atomic.AddInt64(&h.failedMessages, 1)
@@ -206,7 +211,7 @@ func (h *Target) logEntry(entry audit.Entry) {
 	}
 }
 
-func (h *Target) send(entry audit.Entry) error {
+func (h *Target) send(entry interface{}) error {
 	if err := h.initKafkaOnce.Do(h.init); err != nil {
 		return err
 	}
@@ -216,17 +221,21 @@ func (h *Target) send(entry audit.Entry) error {
 	}
 	msg := sarama.ProducerMessage{
 		Topic: h.kconfig.Topic,
-		Key:   sarama.StringEncoder(entry.RequestID),
 		Value: sarama.ByteEncoder(logJSON),
 	}
 	_, _, err = h.producer.SendMessage(&msg)
+	if err != nil {
+		atomic.StoreInt32(&h.status, statusOffline)
+	} else {
+		atomic.StoreInt32(&h.status, statusOnline)
+	}
 	return err
 }
 
 // Init initialize kafka target
 func (h *Target) init() error {
-	if err := h.kconfig.pingBrokers(); err != nil {
-		return err
+	if os.Getenv("_MINIO_KAFKA_DEBUG") != "" {
+		sarama.DebugLogger = log.Default()
 	}
 
 	sconfig := sarama.NewConfig()
@@ -238,6 +247,7 @@ func (h *Target) init() error {
 		sconfig.Version = kafkaVersion
 	}
 
+	sconfig.Net.KeepAlive = 60 * time.Second
 	sconfig.Net.SASL.User = h.kconfig.SASL.User
 	sconfig.Net.SASL.Password = h.kconfig.SASL.Password
 	initScramClient(h.kconfig, sconfig) // initializes configured scram client.
@@ -254,9 +264,20 @@ func (h *Target) init() error {
 	sconfig.Net.TLS.Config.ClientAuth = h.kconfig.TLS.ClientAuth
 	sconfig.Net.TLS.Config.RootCAs = h.kconfig.TLS.RootCAs
 
-	sconfig.Producer.RequiredAcks = sarama.WaitForAll
-	sconfig.Producer.Retry.Max = 10
+	// These settings are needed to ensure that kafka client doesn't hang on brokers
+	// refer https://github.com/IBM/sarama/issues/765#issuecomment-254333355
+	sconfig.Producer.Retry.Max = 2
+	sconfig.Producer.Retry.Backoff = (10 * time.Second)
 	sconfig.Producer.Return.Successes = true
+	sconfig.Producer.Return.Errors = true
+	sconfig.Producer.RequiredAcks = 1
+	sconfig.Producer.Timeout = (10 * time.Second)
+	sconfig.Net.ReadTimeout = (10 * time.Second)
+	sconfig.Net.DialTimeout = (10 * time.Second)
+	sconfig.Net.WriteTimeout = (10 * time.Second)
+	sconfig.Metadata.Retry.Max = 1
+	sconfig.Metadata.Retry.Backoff = (10 * time.Second)
+	sconfig.Metadata.RefreshFrequency = (15 * time.Minute)
 
 	h.config = sconfig
 
@@ -265,51 +286,66 @@ func (h *Target) init() error {
 		brokers = append(brokers, broker.String())
 	}
 
-	producer, err := sarama.NewSyncProducer(brokers, sconfig)
+	client, err := sarama.NewClient(brokers, sconfig)
 	if err != nil {
 		return err
 	}
 
+	producer, err := sarama.NewSyncProducerFromClient(client)
+	if err != nil {
+		return err
+	}
+	h.client = client
 	h.producer = producer
+
+	if len(h.client.Brokers()) > 0 {
+		// Refer https://github.com/IBM/sarama/issues/1341
+		atomic.StoreInt32(&h.status, statusOnline)
+	}
+
 	return nil
 }
 
 // IsOnline returns true if the target is online.
 func (h *Target) IsOnline(_ context.Context) bool {
-	if err := h.initKafkaOnce.Do(h.init); err != nil {
-		return false
-	}
-	return h.kconfig.pingBrokers() == nil
+	return atomic.LoadInt32(&h.status) == statusOnline
 }
 
 // Send log message 'e' to kafka target.
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
-	if auditEntry, ok := entry.(audit.Entry); ok {
-		if h.store != nil {
-			// save the entry to the queue store which will be replayed to the target.
-			return h.store.Put(auditEntry)
+	if h.store != nil {
+		// save the entry to the queue store which will be replayed to the target.
+		_, err := h.store.Put(entry)
+		return err
+	}
+	h.logChMu.RLock()
+	defer h.logChMu.RUnlock()
+	if h.logCh == nil {
+		// We are closing...
+		return nil
+	}
+
+	select {
+	case h.logCh <- entry:
+	case <-ctx.Done():
+		// return error only for context timedout.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ctx.Err()
 		}
-		if err := h.initKafkaOnce.Do(h.init); err != nil {
-			return err
-		}
-		select {
-		case <-h.doneCh:
-		case h.logCh <- auditEntry:
-		default:
-			// log channel is full, do not wait and return
-			// an error immediately to the caller
-			atomic.AddInt64(&h.totalMessages, 1)
-			atomic.AddInt64(&h.failedMessages, 1)
-			return errors.New("log buffer full")
-		}
+		return nil
+	default:
+		// log channel is full, do not wait and return
+		// an error immediately to the caller
+		atomic.AddInt64(&h.totalMessages, 1)
+		atomic.AddInt64(&h.failedMessages, 1)
+		return errors.New("log buffer full")
 	}
 	return nil
 }
 
 // SendFromStore - reads the log from store and sends it to kafka.
-func (h *Target) SendFromStore(key string) (err error) {
-	var auditEntry audit.Entry
-	auditEntry, err = h.store.Get(key)
+func (h *Target) SendFromStore(key store.Key) (err error) {
+	auditEntry, err := h.store.Get(key)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -328,16 +364,27 @@ func (h *Target) SendFromStore(key string) (err error) {
 
 // Cancel - cancels the target
 func (h *Target) Cancel() {
-	close(h.doneCh)
-	close(h.logCh)
 	// If queuestore is configured, cancel it's context to
 	// stop the replay go-routine.
 	if h.store != nil {
 		h.storeCtxCancel()
 	}
+
+	// Set logch to nil and close it.
+	// This will block all Send operations,
+	// and finish the existing ones.
+	// All future ones will be discarded.
+	h.logChMu.Lock()
+	xioutil.SafeClose(h.logCh)
+	h.logCh = nil
+	h.logChMu.Unlock()
+
 	if h.producer != nil {
 		h.producer.Close()
+		h.client.Close()
 	}
+
+	// Wait for messages to be sent...
 	h.wg.Wait()
 }
 
@@ -345,9 +392,9 @@ func (h *Target) Cancel() {
 // sends log over http to the specified endpoint
 func New(config Config) *Target {
 	target := &Target{
-		logCh:   make(chan audit.Entry, 10000),
-		doneCh:  make(chan struct{}),
+		logCh:   make(chan interface{}, config.QueueSize),
 		kconfig: config,
+		status:  statusOffline,
 	}
 	return target
 }

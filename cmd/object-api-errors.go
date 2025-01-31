@@ -27,13 +27,13 @@ import (
 // Converts underlying storage error. Convenience function written to
 // handle all cases where we have known types of errors returned by
 // underlying storage layer.
-func toObjectErr(err error, params ...string) error {
-	if err == nil {
+func toObjectErr(oerr error, params ...string) error {
+	if oerr == nil {
 		return nil
 	}
 
 	// Unwarp the error first
-	err = unwrapAll(err)
+	err := unwrapAll(oerr)
 
 	if err == context.Canceled {
 		return context.Canceled
@@ -157,6 +157,9 @@ func toObjectErr(err error, params ...string) error {
 		if len(params) >= 2 {
 			apiErr.Object = decodeDirObject(params[1])
 		}
+		if v, ok := oerr.(InsufficientReadQuorum); ok {
+			apiErr.Type = v.Type
+		}
 		return apiErr
 	case errErasureWriteQuorum.Error():
 		apiErr := InsufficientWriteQuorum{}
@@ -201,8 +204,34 @@ func (e SlowDown) Error() string {
 	return "Please reduce your request rate"
 }
 
+// RQErrType reason for read quorum error.
+type RQErrType int
+
+const (
+	// RQInsufficientOnlineDrives - not enough online drives.
+	RQInsufficientOnlineDrives RQErrType = 1 << iota
+	// RQInconsistentMeta - inconsistent metadata.
+	RQInconsistentMeta
+)
+
+func (t RQErrType) String() string {
+	switch t {
+	case RQInsufficientOnlineDrives:
+		return "InsufficientOnlineDrives"
+	case RQInconsistentMeta:
+		return "InconsistentMeta"
+	default:
+		return "Unknown"
+	}
+}
+
 // InsufficientReadQuorum storage cannot satisfy quorum for read operation.
-type InsufficientReadQuorum GenericError
+type InsufficientReadQuorum struct {
+	Bucket string
+	Object string
+	Err    error
+	Type   RQErrType
+}
 
 func (e InsufficientReadQuorum) Error() string {
 	return "Storage resources are insufficient for the read operation " + e.Bucket + "/" + e.Object
@@ -346,15 +375,6 @@ type InvalidUploadIDKeyCombination struct {
 
 func (e InvalidUploadIDKeyCombination) Error() string {
 	return fmt.Sprintf("Invalid combination of uploadID marker '%s' and marker '%s'", e.UploadIDMarker, e.KeyMarker)
-}
-
-// InvalidMarkerPrefixCombination - invalid marker and prefix combination.
-type InvalidMarkerPrefixCombination struct {
-	Marker, Prefix string
-}
-
-func (e InvalidMarkerPrefixCombination) Error() string {
-	return fmt.Sprintf("Invalid combination of marker '%s' and prefix '%s'", e.Marker, e.Prefix)
 }
 
 // BucketPolicyNotFound - no bucket policy found.
@@ -548,7 +568,7 @@ func (e ObjectNameTooLong) Error() string {
 
 // Error returns string an error formatted as the given text.
 func (e ObjectNamePrefixAsSlash) Error() string {
-	return "Object name contains forward slash as pefix: " + e.Bucket + "/" + e.Object
+	return "Object name contains forward slash as prefix: " + e.Bucket + "/" + e.Object
 }
 
 // AllAccessDisabled All access to this object has been disabled
@@ -575,7 +595,7 @@ type InvalidRange struct {
 }
 
 func (e InvalidRange) Error() string {
-	return fmt.Sprintf("The requested range \"bytes %d -> %d of %d\" is not satisfiable.", e.OffsetBegin, e.OffsetEnd, e.ResourceSize)
+	return fmt.Sprintf("The requested range 'bytes=%d-%d' is not satisfiable", e.OffsetBegin, e.OffsetEnd)
 }
 
 // ObjectTooLarge error returned when the size of the object > max object size allowed (5G) per request.
@@ -685,24 +705,42 @@ func (e UnsupportedMetadata) Error() string {
 
 // isErrBucketNotFound - Check if error type is BucketNotFound.
 func isErrBucketNotFound(err error) bool {
+	if errors.Is(err, errVolumeNotFound) {
+		return true
+	}
+
 	var bkNotFound BucketNotFound
 	return errors.As(err, &bkNotFound)
 }
 
-// isErrReadQuorum check if the error type is InsufficentReadQuorum
+// isErrReadQuorum check if the error type is InsufficientReadQuorum
 func isErrReadQuorum(err error) bool {
 	var rquorum InsufficientReadQuorum
 	return errors.As(err, &rquorum)
 }
 
+// isErrWriteQuorum check if the error type is InsufficientWriteQuorum
+func isErrWriteQuorum(err error) bool {
+	var rquorum InsufficientWriteQuorum
+	return errors.As(err, &rquorum)
+}
+
 // isErrObjectNotFound - Check if error type is ObjectNotFound.
 func isErrObjectNotFound(err error) bool {
+	if errors.Is(err, errFileNotFound) {
+		return true
+	}
+
 	var objNotFound ObjectNotFound
 	return errors.As(err, &objNotFound)
 }
 
 // isErrVersionNotFound - Check if error type is VersionNotFound.
 func isErrVersionNotFound(err error) bool {
+	if errors.Is(err, errFileVersionNotFound) {
+		return true
+	}
+
 	var versionNotFound VersionNotFound
 	return errors.As(err, &versionNotFound)
 }
@@ -732,6 +770,38 @@ func isErrMethodNotAllowed(err error) bool {
 }
 
 func isErrInvalidRange(err error) bool {
+	if errors.Is(err, errInvalidRange) {
+		return true
+	}
 	_, ok := err.(InvalidRange)
 	return ok
+}
+
+// ReplicationPermissionCheck - Check if error type is ReplicationPermissionCheck.
+type ReplicationPermissionCheck struct{}
+
+func (e ReplicationPermissionCheck) Error() string {
+	return "Replication permission validation requests cannot be completed"
+}
+
+func isReplicationPermissionCheck(err error) bool {
+	_, ok := err.(ReplicationPermissionCheck)
+	return ok
+}
+
+// DataMovementOverwriteErr - captures the error when a data movement activity
+// like rebalance incorrectly tries to overwrite an object.
+type DataMovementOverwriteErr GenericError
+
+func (de DataMovementOverwriteErr) Error() string {
+	objInfoStr := fmt.Sprintf("bucket=%s object=%s", de.Bucket, de.Object)
+	if de.VersionID != "" {
+		objInfoStr = fmt.Sprintf("%s version-id=%s", objInfoStr, de.VersionID)
+	}
+	return fmt.Sprintf("invalid data movement operation, source and destination pool are the same for %s", objInfoStr)
+}
+
+func isDataMovementOverWriteErr(err error) bool {
+	var de DataMovementOverwriteErr
+	return errors.As(err, &de)
 }

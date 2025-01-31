@@ -19,7 +19,7 @@ package target
 import (
 	"testing"
 
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 )
 

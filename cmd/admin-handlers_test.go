@@ -31,7 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/mux"
 )
@@ -73,7 +73,7 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 	// Initialize boot time
 	globalBootTime = UTCNow()
 
-	globalEndpoints = mustGetPoolEndpoints(erasureDirs...)
+	globalEndpoints = mustGetPoolEndpoints(0, erasureDirs...)
 
 	initAllSubsystems(ctx)
 
@@ -108,7 +108,7 @@ func initTestErasureObjLayer(ctx context.Context) (ObjectLayer, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
-	endpoints := mustGetPoolEndpoints(erasureDirs...)
+	endpoints := mustGetPoolEndpoints(0, erasureDirs...)
 	globalPolicySys = NewPolicySys()
 	objLayer, err := newErasureServerPools(ctx, endpoints)
 	if err != nil {
@@ -168,6 +168,7 @@ func testServiceSignalReceiver(cmd cmdType, t *testing.T) {
 func getServiceCmdRequest(cmd cmdType, cred auth.Credentials) (*http.Request, error) {
 	queryVal := url.Values{}
 	queryVal.Set("action", string(cmd.toServiceAction()))
+	queryVal.Set("type", "2")
 	resource := adminPathPrefix + adminAPIVersionPrefix + "/service?" + queryVal.Encode()
 	req, err := newTestRequest(http.MethodPost, resource, 0, nil)
 	if err != nil {
@@ -220,11 +221,17 @@ func testServicesCmdHandler(cmd cmdType, t *testing.T) {
 	rec := httptest.NewRecorder()
 	adminTestBed.router.ServeHTTP(rec, req)
 
+	resp, _ := io.ReadAll(rec.Body)
 	if rec.Code != http.StatusOK {
-		resp, _ := io.ReadAll(rec.Body)
 		t.Errorf("Expected to receive %d status code but received %d. Body (%s)",
 			http.StatusOK, rec.Code, string(resp))
 	}
+
+	result := &serviceResult{}
+	if err := json.Unmarshal(resp, result); err != nil {
+		t.Error(err)
+	}
+	_ = result
 
 	// Wait until testServiceSignalReceiver() called in a goroutine quits.
 	wg.Wait()
@@ -341,7 +348,7 @@ func TestExtractHealInitParams(t *testing.T) {
 		}
 		return v
 	}
-	qParmsArr := []url.Values{
+	qParamsArr := []url.Values{
 		// Invalid cases
 		mkParams("", true, true),
 		mkParams("111", true, true),
@@ -366,9 +373,9 @@ func TestExtractHealInitParams(t *testing.T) {
 	body := `{"recursive": false, "dryRun": true, "remove": false, "scanMode": 0}`
 
 	// Test all combinations!
-	for pIdx, parms := range qParmsArr {
+	for pIdx, params := range qParamsArr {
 		for vIdx, vars := range varsArr {
-			_, err := extractHealInitParams(vars, parms, bytes.NewReader([]byte(body)))
+			_, err := extractHealInitParams(vars, params, bytes.NewReader([]byte(body)))
 			isErrCase := false
 			if pIdx < 4 || vIdx < 1 {
 				isErrCase = true
@@ -456,6 +463,7 @@ func TestTopLockEntries(t *testing.T) {
 			Owner:      lri.Owner,
 			ID:         lri.UID,
 			Quorum:     lri.Quorum,
+			Timestamp:  time.Unix(0, lri.Timestamp),
 		})
 	}
 

@@ -32,7 +32,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/rabbitmq/amqp091-go"
 )
 
@@ -276,7 +276,8 @@ func (target *AMQPTarget) send(eventData event.Event, ch *amqp091.Channel, confi
 // Save - saves the events to the store which will be replayed when the amqp connection is active.
 func (target *AMQPTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 	if err := target.init(); err != nil {
 		return err
@@ -291,7 +292,7 @@ func (target *AMQPTarget) Save(eventData event.Event) error {
 }
 
 // SendFromStore - reads an event from store and sends it to AMQP091.
-func (target *AMQPTarget) SendFromStore(eventKey string) error {
+func (target *AMQPTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -302,7 +303,7 @@ func (target *AMQPTarget) SendFromStore(eventKey string) error {
 	}
 	defer ch.Close()
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -317,7 +318,7 @@ func (target *AMQPTarget) SendFromStore(eventKey string) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.

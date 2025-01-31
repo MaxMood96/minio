@@ -24,10 +24,10 @@ import (
 	"net/http"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -84,7 +84,7 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	bucketPolicy, err := policy.ParseConfig(bytes.NewReader(bucketPolicyBytes), bucket)
+	bucketPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyBytes), bucket)
 	if err != nil {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "MalformedPolicy",
@@ -113,7 +113,7 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 	}
 
 	// Call site replication hook.
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypePolicy,
 		Bucket:    bucket,
 		Policy:    bucketPolicyBytes,
@@ -157,7 +157,7 @@ func (api objectAPIHandlers) DeleteBucketPolicyHandler(w http.ResponseWriter, r 
 	}
 
 	// Call site replication hook.
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypePolicy,
 		Bucket:    bucket,
 		UpdatedAt: updatedAt,

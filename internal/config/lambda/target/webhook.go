@@ -23,7 +23,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -31,9 +30,10 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/config/lambda/event"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/certs"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/certs"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Webhook constants
@@ -133,13 +133,12 @@ func (target *WebhookTarget) isActive() (bool, error) {
 		}
 		return false, err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	xhttp.DrainBody(resp.Body)
 	// No network failure i.e response from the target means its up
 	return true, nil
 }
 
-// Stat - returns lamdba webhook target statistics such as
+// Stat - returns lambda webhook target statistics such as
 // current calls in progress, successfully completed functions
 // failed functions.
 func (target *WebhookTarget) Stat() event.TargetStat {

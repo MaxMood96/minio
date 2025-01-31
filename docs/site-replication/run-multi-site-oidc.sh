@@ -57,11 +57,13 @@ if [ ! -f ./mc ]; then
 		chmod +x mc
 fi
 
-sleep 10
-
 export MC_HOST_minio1=http://minio:minio123@localhost:9001
 export MC_HOST_minio2=http://minio:minio123@localhost:9002
 export MC_HOST_minio3=http://minio:minio123@localhost:9003
+
+./mc ready minio1
+./mc ready minio2
+./mc ready minio3
 
 ./mc admin replicate add minio1 minio2 minio3
 
@@ -174,13 +176,13 @@ expected_checksum=$(cat ./lrgfile | md5sum)
 
 ./mc cp ./lrgfile minio1/newbucket
 sleep 5
-./mc stat minio2/newbucket
+./mc stat --no-list minio2/newbucket
 if [ $? -ne 0 ]; then
 	echo "expecting bucket to be present. exiting.."
 	exit_1
 fi
 
-./mc stat minio3/newbucket
+./mc stat --no-list minio3/newbucket
 if [ $? -ne 0 ]; then
 	echo "expecting bucket to be present. exiting.."
 	exit_1
@@ -189,13 +191,13 @@ fi
 ./mc cp README.md minio2/newbucket/
 
 sleep 5
-./mc stat minio1/newbucket/README.md
+./mc stat --no-list minio1/newbucket/README.md
 if [ $? -ne 0 ]; then
 	echo "expecting object to be present. exiting.."
 	exit_1
 fi
 
-./mc stat minio3/newbucket/README.md
+./mc stat --no-list minio3/newbucket/README.md
 if [ $? -ne 0 ]; then
 	echo "expecting object to be present. exiting.."
 	exit_1
@@ -204,20 +206,20 @@ fi
 ./mc rm minio3/newbucket/README.md
 sleep 5
 
-./mc stat minio2/newbucket/README.md
+./mc stat --no-list minio2/newbucket/README.md
 if [ $? -eq 0 ]; then
 	echo "expected file to be deleted, exiting.."
 	exit_1
 fi
 
-./mc stat minio1/newbucket/README.md
+./mc stat --no-list minio1/newbucket/README.md
 if [ $? -eq 0 ]; then
 	echo "expected file to be deleted, exiting.."
 	exit_1
 fi
 
 sleep 10
-./mc stat minio3/newbucket/lrgfile
+./mc stat --no-list minio3/newbucket/lrgfile
 if [ $? -ne 0 ]; then
 	echo "expected object to be present, exiting.."
 	exit_1
@@ -228,6 +230,19 @@ if [ "${expected_checksum}" != "${actual_checksum}" ]; then
 	exit
 fi
 rm ./lrgfile
+
+./mc rm -r --versions --force minio1/newbucket/lrgfile
+if [ $? -ne 0 ]; then
+	echo "expected object to be present, exiting.."
+	exit_1
+fi
+
+sleep 5
+./mc stat --no-list minio1/newbucket/lrgfile
+if [ $? -eq 0 ]; then
+	echo "expected object to be deleted permanently after replication, exiting.."
+	exit_1
+fi
 
 ./mc mb --with-lock minio3/newbucket-olock
 sleep 5
@@ -292,4 +307,21 @@ diff -q <(./mc ls minio1) <(./mc ls minio2) 1>/dev/null
 if [ $? -ne 0 ]; then
 	echo "expected 'bucket2' delete and 'newbucket2' creation to have replicated, exiting..."
 	exit_1
+fi
+
+# force a resync after removing all site replication
+./mc admin replicate rm --all --force minio1
+./mc rb minio2 --force --dangerous
+./mc admin replicate add minio1 minio2
+./mc admin replicate resync start minio1 minio2
+sleep 30
+
+./mc ls -r --versions minio1/newbucket >/tmp/minio1.txt
+./mc ls -r --versions minio2/newbucket >/tmp/minio2.txt
+
+out=$(diff -qpruN /tmp/minio1.txt /tmp/minio2.txt)
+ret=$?
+if [ $ret -ne 0 ]; then
+	echo "BUG: expected no missing entries after replication resync: $out"
+	exit 1
 fi

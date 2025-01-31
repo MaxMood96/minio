@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/mcontext"
@@ -55,6 +55,7 @@ func getOpName(name string) (op string) {
 	op = strings.Replace(op, "(*peerRESTServer)", "peer", 1)
 	op = strings.Replace(op, "(*lockRESTServer)", "lockR", 1)
 	op = strings.Replace(op, "(*stsAPIHandlers)", "sts", 1)
+	op = strings.Replace(op, "(*peerS3Server)", "s3", 1)
 	op = strings.Replace(op, "ClusterCheckHandler", "health.Cluster", 1)
 	op = strings.Replace(op, "ClusterReadCheckHandler", "health.ClusterRead", 1)
 	op = strings.Replace(op, "LivenessCheckHandler", "health.Liveness", 1)
@@ -65,7 +66,7 @@ func getOpName(name string) (op string) {
 
 // If trace is enabled, execute the request if it is traced by other handlers
 // otherwise, generate a trace event with request information but no response.
-func httpTracer(h http.Handler) http.Handler {
+func httpTracerMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Setup a http request response recorder - this is needed for
 		// http stats requests and audit if enabled.
@@ -77,7 +78,7 @@ func httpTracer(h http.Handler) http.Handler {
 
 		// Create tracing data structure and associate it to the request context
 		tc := mcontext.TraceCtxt{
-			AmzReqID:         r.Header.Get(xhttp.AmzRequestID),
+			AmzReqID:         w.Header().Get(xhttp.AmzRequestID),
 			RequestRecorder:  reqRecorder,
 			ResponseRecorder: respRecorder,
 		}
@@ -141,6 +142,7 @@ func httpTracer(h http.Handler) http.Handler {
 			Time:      reqStartTime,
 			Duration:  reqEndTime.Sub(respRecorder.StartTime),
 			Path:      reqPath,
+			Bytes:     int64(inputBytes + respRecorder.Size()),
 			HTTP: &madmin.TraceHTTPStats{
 				ReqInfo: madmin.TraceRequestInfo{
 					Time:     reqStartTime,
@@ -162,7 +164,7 @@ func httpTracer(h http.Handler) http.Handler {
 					Latency:         reqEndTime.Sub(respRecorder.StartTime),
 					InputBytes:      inputBytes,
 					OutputBytes:     respRecorder.Size(),
-					TimeToFirstByte: respRecorder.TimeToFirstByte,
+					TimeToFirstByte: respRecorder.TTFB(),
 				},
 			},
 		}

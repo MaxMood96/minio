@@ -18,13 +18,9 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"runtime"
@@ -37,10 +33,8 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
-	"github.com/minio/pkg/wildcard"
-	"github.com/minio/pkg/workers"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/workers"
 )
 
 // keyrotate:
@@ -76,56 +70,6 @@ import (
 
 //go:generate msgp -file $GOFILE -unexported
 
-// BatchKeyRotateKV is a datatype that holds key and values for filtering of objects
-// used by metadata filter as well as tags based filtering.
-type BatchKeyRotateKV struct {
-	Key   string `yaml:"key" json:"key"`
-	Value string `yaml:"value" json:"value"`
-}
-
-// Validate returns an error if key is empty
-func (kv BatchKeyRotateKV) Validate() error {
-	if kv.Key == "" {
-		return errInvalidArgument
-	}
-	return nil
-}
-
-// Empty indicates if kv is not set
-func (kv BatchKeyRotateKV) Empty() bool {
-	return kv.Key == "" && kv.Value == ""
-}
-
-// Match matches input kv with kv, value will be wildcard matched depending on the user input
-func (kv BatchKeyRotateKV) Match(ikv BatchKeyRotateKV) bool {
-	if kv.Empty() {
-		return true
-	}
-	if strings.EqualFold(kv.Key, ikv.Key) {
-		return wildcard.Match(kv.Value, ikv.Value)
-	}
-	return false
-}
-
-// BatchKeyRotateRetry datatype represents total retry attempts and delay between each retries.
-type BatchKeyRotateRetry struct {
-	Attempts int           `yaml:"attempts" json:"attempts"` // number of retry attempts
-	Delay    time.Duration `yaml:"delay" json:"delay"`       // delay between each retries
-}
-
-// Validate validates input replicate retries.
-func (r BatchKeyRotateRetry) Validate() error {
-	if r.Attempts < 0 {
-		return errInvalidArgument
-	}
-
-	if r.Delay < 0 {
-		return errInvalidArgument
-	}
-
-	return nil
-}
-
 // BatchKeyRotationType defines key rotation type
 type BatchKeyRotationType string
 
@@ -151,6 +95,7 @@ func (e BatchJobKeyRotateEncryption) Validate() error {
 	if e.Type == ssekms && spaces {
 		return crypto.ErrInvalidEncryptionKeyID
 	}
+
 	if e.Type == ssekms && GlobalKMS != nil {
 		ctx := kms.Context{}
 		if e.Context != "" {
@@ -169,7 +114,7 @@ func (e BatchJobKeyRotateEncryption) Validate() error {
 			e.kmsContext[k] = v
 		}
 		ctx["MinIO batch API"] = "batchrotate" // Context for a test key operation
-		if _, err := GlobalKMS.GenerateKey(GlobalContext, e.Key, ctx); err != nil {
+		if _, err := GlobalKMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{Name: e.Key, AssociatedData: ctx}); err != nil {
 			return err
 		}
 	}
@@ -178,13 +123,13 @@ func (e BatchJobKeyRotateEncryption) Validate() error {
 
 // BatchKeyRotateFilter holds all the filters currently supported for batch replication
 type BatchKeyRotateFilter struct {
-	NewerThan     time.Duration      `yaml:"newerThan,omitempty" json:"newerThan"`
-	OlderThan     time.Duration      `yaml:"olderThan,omitempty" json:"olderThan"`
-	CreatedAfter  time.Time          `yaml:"createdAfter,omitempty" json:"createdAfter"`
-	CreatedBefore time.Time          `yaml:"createdBefore,omitempty" json:"createdBefore"`
-	Tags          []BatchKeyRotateKV `yaml:"tags,omitempty" json:"tags"`
-	Metadata      []BatchKeyRotateKV `yaml:"metadata,omitempty" json:"metadata"`
-	KMSKeyID      string             `yaml:"kmskeyid" json:"kmskey"`
+	NewerThan     time.Duration `yaml:"newerThan,omitempty" json:"newerThan"`
+	OlderThan     time.Duration `yaml:"olderThan,omitempty" json:"olderThan"`
+	CreatedAfter  time.Time     `yaml:"createdAfter,omitempty" json:"createdAfter"`
+	CreatedBefore time.Time     `yaml:"createdBefore,omitempty" json:"createdBefore"`
+	Tags          []BatchJobKV  `yaml:"tags,omitempty" json:"tags"`
+	Metadata      []BatchJobKV  `yaml:"metadata,omitempty" json:"metadata"`
+	KMSKeyID      string        `yaml:"kmskeyid" json:"kmskey"`
 }
 
 // BatchKeyRotateNotification success or failure notification endpoint for each job attempts
@@ -198,9 +143,9 @@ type BatchKeyRotateNotification struct {
 // - notify
 // - retry
 type BatchJobKeyRotateFlags struct {
-	Filter BatchKeyRotateFilter       `yaml:"filter" json:"filter"`
-	Notify BatchKeyRotateNotification `yaml:"notify" json:"notify"`
-	Retry  BatchKeyRotateRetry        `yaml:"retry" json:"retry"`
+	Filter BatchKeyRotateFilter `yaml:"filter" json:"filter"`
+	Notify BatchJobNotification `yaml:"notify" json:"notify"`
+	Retry  BatchJobRetry        `yaml:"retry" json:"retry"`
 }
 
 // BatchJobKeyRotateV1 v1 of batch key rotation job
@@ -209,40 +154,12 @@ type BatchJobKeyRotateV1 struct {
 	Flags      BatchJobKeyRotateFlags      `yaml:"flags" json:"flags"`
 	Bucket     string                      `yaml:"bucket" json:"bucket"`
 	Prefix     string                      `yaml:"prefix" json:"prefix"`
-	Endpoint   string                      `yaml:"endpoint" json:"endpoint"`
 	Encryption BatchJobKeyRotateEncryption `yaml:"encryption" json:"encryption"`
 }
 
 // Notify notifies notification endpoint if configured regarding job failure or success.
-func (r BatchJobKeyRotateV1) Notify(ctx context.Context, body io.Reader) error {
-	if r.Flags.Notify.Endpoint == "" {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Flags.Notify.Endpoint, body)
-	if err != nil {
-		return err
-	}
-
-	if r.Flags.Notify.Token != "" {
-		req.Header.Set("Authorization", r.Flags.Notify.Token)
-	}
-
-	clnt := http.Client{Transport: getRemoteInstanceTransport}
-	resp, err := clnt.Do(req)
-	if err != nil {
-		return err
-	}
-
-	xhttp.DrainBody(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return errors.New(resp.Status)
-	}
-
-	return nil
+func (r BatchJobKeyRotateV1) Notify(ctx context.Context, ri *batchJobInfo) error {
+	return notifyEndpoint(ctx, ri, r.Flags.Notify.Endpoint, r.Flags.Notify.Token)
 }
 
 // KeyRotate rotates encryption key of an object
@@ -289,7 +206,7 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	)
 	encMetadata := make(map[string]string)
 	for k, v := range oi.UserDefined {
-		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 			encMetadata[k] = v
 		}
 	}
@@ -330,7 +247,7 @@ const (
 	batchKeyRotateVersion              = batchKeyRotateVersionV1
 	batchKeyRotateAPIVersion           = "v1"
 	batchKeyRotateJobDefaultRetries    = 3
-	batchKeyRotateJobDefaultRetryDelay = 250 * time.Millisecond
+	batchKeyRotateJobDefaultRetryDelay = 25 * time.Millisecond
 )
 
 // Start the batch key rottion job, resumes if there was a pending job via "job.ID"
@@ -340,20 +257,28 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		JobType:   string(job.Type()),
 		StartTime: job.Started,
 	}
-	if err := ri.load(ctx, api, job); err != nil {
+	if err := ri.loadOrInit(ctx, api, job); err != nil {
 		return err
+	}
+	if ri.Complete {
+		return nil
 	}
 
 	globalBatchJobsMetrics.save(job.ID, ri)
 	lastObject := ri.Object
 
+	retryAttempts := job.KeyRotate.Flags.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchKeyRotateJobDefaultRetries
+	}
 	delay := job.KeyRotate.Flags.Retry.Delay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = batchKeyRotateJobDefaultRetryDelay
 	}
+
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	skip := func(info FileInfo) (ok bool) {
+	selectObj := func(info FileInfo) (ok bool) {
 		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan {
 			// skip all objects that are newer than specified older duration
 			return false
@@ -388,7 +313,7 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 			for _, kv := range r.Flags.Filter.Tags {
 				for t, v := range tagMap {
-					if kv.Match(BatchKeyRotateKV{Key: t, Value: v}) {
+					if kv.Match(BatchJobKV{Key: t, Value: v}) {
 						return true
 					}
 				}
@@ -401,11 +326,11 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		if len(r.Flags.Filter.Metadata) > 0 {
 			for _, kv := range r.Flags.Filter.Metadata {
 				for k, v := range info.Metadata {
-					if !strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") && !isStandardHeader(k) {
+					if !stringsHasPrefixFold(k, "x-amz-meta-") && !isStandardHeader(k) {
 						continue
 					}
 					// We only need to match x-amz-meta or standardHeaders
-					if kv.Match(BatchKeyRotateKV{Key: k, Value: v}) {
+					if kv.Match(BatchJobKV{Key: k, Value: v}) {
 						return true
 					}
 				}
@@ -433,21 +358,25 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		return err
 	}
 
-	retryAttempts := ri.RetryAttempts
 	ctx, cancel := context.WithCancel(ctx)
 
-	results := make(chan ObjectInfo, 100)
-	if err := api.Walk(ctx, r.Bucket, r.Prefix, results, ObjectOptions{
-		WalkMarker: lastObject,
-		WalkFilter: skip,
+	results := make(chan itemOrErr[ObjectInfo], 100)
+	if err := api.Walk(ctx, r.Bucket, r.Prefix, results, WalkOptions{
+		Marker: lastObject,
+		Filter: selectObj,
 	}); err != nil {
 		cancel()
 		// Do not need to retry if we can't list objects on source.
 		return err
 	}
-
-	for result := range results {
-		result := result
+	failed := false
+	for res := range results {
+		if res.Err != nil {
+			failed = true
+			batchLogIf(ctx, res.Err)
+			break
+		}
+		result := res.Item
 		sseKMS := crypto.S3KMS.IsEncrypted(result.UserDefined)
 		sseS3 := crypto.S3.IsEncrypted(result.UserDefined)
 		if !sseKMS && !sseS3 { // neither sse-s3 nor sse-kms disallowed
@@ -457,49 +386,56 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		go func() {
 			defer wk.Give()
 			for attempts := 1; attempts <= retryAttempts; attempts++ {
-				attempts := attempts
-				stopFn := globalBatchJobsMetrics.trace(batchKeyRotationMetricObject, job.ID, attempts, result)
+				stopFn := globalBatchJobsMetrics.trace(batchJobMetricKeyRotation, job.ID, attempts)
 				success := true
 				if err := r.KeyRotate(ctx, api, result); err != nil {
-					stopFn(err)
-					logger.LogIf(ctx, err)
+					stopFn(result, err)
+					batchLogIf(ctx, err)
 					success = false
+					if attempts >= retryAttempts {
+						auditOptions := AuditLogOptions{
+							Event:     "KeyRotate",
+							APIName:   "StartBatchJob",
+							Bucket:    result.Bucket,
+							Object:    result.Name,
+							VersionID: result.VersionID,
+							Error:     err.Error(),
+						}
+						auditLogInternal(ctx, auditOptions)
+					}
 				} else {
-					stopFn(nil)
+					stopFn(result, nil)
 				}
-				ri.trackCurrentBucketObject(r.Bucket, result, success)
-				ri.RetryAttempts = attempts
+				ri.trackCurrentBucketObject(r.Bucket, result, success, attempts)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
-				logger.LogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 				if success {
 					break
 				}
+				if delay > 0 {
+					time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
+				}
+			}
+
+			if wait := globalBatchConfig.KeyRotationWait(); wait > 0 {
+				time.Sleep(wait)
 			}
 		}()
 	}
 	wk.Wait()
 
-	ri.Complete = ri.ObjectsFailed == 0
-	ri.Failed = ri.ObjectsFailed > 0
+	ri.Complete = !failed && ri.ObjectsFailed == 0
+	ri.Failed = failed || ri.ObjectsFailed > 0
 	globalBatchJobsMetrics.save(job.ID, ri)
 	// persist in-memory state to disk.
-	logger.LogIf(ctx, ri.updateAfter(ctx, api, 0, job))
+	batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 
-	buf, _ := json.Marshal(ri)
-	if err := r.Notify(ctx, bytes.NewReader(buf)); err != nil {
-		logger.LogIf(ctx, fmt.Errorf("unable to notify %v", err))
+	if err := r.Notify(ctx, ri); err != nil {
+		batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
 	}
 
 	cancel()
-	if ri.Failed {
-		ri.ObjectsFailed = 0
-		ri.Bucket = ""
-		ri.Object = ""
-		ri.Objects = 0
-		time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
-	}
-
 	return nil
 }
 
@@ -557,8 +493,5 @@ func (r *BatchJobKeyRotateV1) Validate(ctx context.Context, job BatchJobRequest,
 		}
 	}
 
-	if err := r.Flags.Retry.Validate(); err != nil {
-		return err
-	}
-	return nil
+	return r.Flags.Retry.Validate()
 }

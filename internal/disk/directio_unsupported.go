@@ -1,7 +1,6 @@
-//go:build !linux && !netbsd && !freebsd && !darwin
-// +build !linux,!netbsd,!freebsd,!darwin
+//go:build windows || openbsd || plan9
 
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -64,6 +63,6 @@ func DisableDirectIO(f *os.File) error {
 
 // AlignedBlock simply returns an unaligned buffer
 // for systems that do not support DirectIO.
-func AlignedBlock(BlockSize int) []byte {
-	return make([]byte, BlockSize)
+func AlignedBlock(blockSize int) []byte {
+	return make([]byte, blockSize)
 }

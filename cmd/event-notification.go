@@ -21,55 +21,46 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // EventNotifier - notifies external systems about events in MinIO.
 type EventNotifier struct {
 	sync.RWMutex
-	targetList                 *event.TargetList
-	targetResCh                chan event.TargetIDResult
-	bucketRulesMap             map[string]event.RulesMap
-	bucketRemoteTargetRulesMap map[string]map[event.TargetID]event.RulesMap
+	targetList     *event.TargetList
+	bucketRulesMap map[string]event.RulesMap
 }
 
 // NewEventNotifier - creates new event notification object.
-func NewEventNotifier() *EventNotifier {
+func NewEventNotifier(ctx context.Context) *EventNotifier {
 	// targetList/bucketRulesMap/bucketRemoteTargetRulesMap are populated by NotificationSys.InitBucketTargets()
 	return &EventNotifier{
-		targetList:                 event.NewTargetList(),
-		targetResCh:                make(chan event.TargetIDResult),
-		bucketRulesMap:             make(map[string]event.RulesMap),
-		bucketRemoteTargetRulesMap: make(map[string]map[event.TargetID]event.RulesMap),
+		targetList:     event.NewTargetList(ctx),
+		bucketRulesMap: make(map[string]event.RulesMap),
 	}
 }
 
 // GetARNList - returns available ARNs.
-func (evnot *EventNotifier) GetARNList(onlyActive bool) []string {
+func (evnot *EventNotifier) GetARNList() []string {
 	arns := []string{}
 	if evnot == nil {
 		return arns
 	}
-	region := globalSite.Region
-	for targetID, target := range evnot.targetList.TargetMap() {
+	region := globalSite.Region()
+	for targetID := range evnot.targetList.TargetMap() {
 		// httpclient target is part of ListenNotification
 		// which doesn't need to be listed as part of the ARN list
 		// This list is only meant for external targets, filter
 		// this out pro-actively.
 		if !strings.HasPrefix(targetID.ID, "httpclient+") {
-			if onlyActive {
-				if _, err := target.IsActive(); err != nil {
-					continue
-				}
-			}
 			arns = append(arns, targetID.ToARN(region).String())
 		}
 	}
@@ -78,18 +69,24 @@ func (evnot *EventNotifier) GetARNList(onlyActive bool) []string {
 }
 
 // Loads notification policies for all buckets into EventNotifier.
-func (evnot *EventNotifier) set(bucket BucketInfo, meta BucketMetadata) {
+func (evnot *EventNotifier) set(bucket string, meta BucketMetadata) {
 	config := meta.notificationConfig
 	if config == nil {
 		return
 	}
-	config.SetRegion(globalSite.Region)
-	if err := config.Validate(globalSite.Region, globalEventNotifier.targetList); err != nil {
+	region := globalSite.Region()
+	config.SetRegion(region)
+	if err := config.Validate(region, globalEventNotifier.targetList); err != nil {
 		if _, ok := err.(*event.ErrARNNotFound); !ok {
-			logger.LogIf(GlobalContext, err)
+			internalLogIf(GlobalContext, err)
 		}
 	}
-	evnot.AddRulesMap(bucket.Name, config.ToRulesMap())
+	evnot.AddRulesMap(bucket, config.ToRulesMap())
+}
+
+// Targets returns all the registered targets
+func (evnot *EventNotifier) Targets() []event.Target {
+	return evnot.targetList.Targets()
 }
 
 // InitBucketTargets - initializes event notification system from notification.xml of all buckets.
@@ -101,17 +98,7 @@ func (evnot *EventNotifier) InitBucketTargets(ctx context.Context, objAPI Object
 	if err := evnot.targetList.Add(globalNotifyTargetList.Targets()...); err != nil {
 		return err
 	}
-
-	go func() {
-		for res := range evnot.targetResCh {
-			if res.Err != nil {
-				reqInfo := &logger.ReqInfo{}
-				reqInfo.AppendTags("targetID", res.ID.Name)
-				logger.LogOnceIf(logger.SetReqInfo(GlobalContext, reqInfo), res.Err, res.ID.String())
-			}
-		}
-	}()
-
+	evnot.targetList = evnot.targetList.Init(runtime.GOMAXPROCS(0)) // TODO: make this configurable (y4m4)
 	return nil
 }
 
@@ -122,10 +109,6 @@ func (evnot *EventNotifier) AddRulesMap(bucketName string, rulesMap event.RulesM
 
 	rulesMap = rulesMap.Clone()
 
-	for _, targetRulesMap := range evnot.bucketRemoteTargetRulesMap[bucketName] {
-		rulesMap.Add(targetRulesMap)
-	}
-
 	// Do not add for an empty rulesMap.
 	if len(rulesMap) == 0 {
 		delete(evnot.bucketRulesMap, bucketName)
@@ -134,69 +117,24 @@ func (evnot *EventNotifier) AddRulesMap(bucketName string, rulesMap event.RulesM
 	}
 }
 
-// RemoveRulesMap - removes rules map for bucket name.
-func (evnot *EventNotifier) RemoveRulesMap(bucketName string, rulesMap event.RulesMap) {
-	evnot.Lock()
-	defer evnot.Unlock()
-
-	evnot.bucketRulesMap[bucketName].Remove(rulesMap)
-	if len(evnot.bucketRulesMap[bucketName]) == 0 {
-		delete(evnot.bucketRulesMap, bucketName)
-	}
-}
-
-// ConfiguredTargetIDs - returns list of configured target id's
-func (evnot *EventNotifier) ConfiguredTargetIDs() []event.TargetID {
-	if evnot == nil {
-		return nil
-	}
-
-	evnot.RLock()
-	defer evnot.RUnlock()
-
-	var targetIDs []event.TargetID
-	for _, rmap := range evnot.bucketRulesMap {
-		for _, rules := range rmap {
-			for _, targetSet := range rules {
-				for id := range targetSet {
-					targetIDs = append(targetIDs, id)
-				}
-			}
-		}
-	}
-
-	return targetIDs
-}
-
 // RemoveNotification - removes all notification configuration for bucket name.
 func (evnot *EventNotifier) RemoveNotification(bucketName string) {
 	evnot.Lock()
 	defer evnot.Unlock()
 
 	delete(evnot.bucketRulesMap, bucketName)
-
-	targetIDSet := event.NewTargetIDSet()
-	for targetID := range evnot.bucketRemoteTargetRulesMap[bucketName] {
-		targetIDSet[targetID] = struct{}{}
-		delete(evnot.bucketRemoteTargetRulesMap[bucketName], targetID)
-	}
-	evnot.targetList.Remove(targetIDSet)
-
-	delete(evnot.bucketRemoteTargetRulesMap, bucketName)
 }
 
-// RemoveAllRemoteTargets - closes and removes all notification targets.
-func (evnot *EventNotifier) RemoveAllRemoteTargets() {
+// RemoveAllBucketTargets - closes and removes all notification targets.
+func (evnot *EventNotifier) RemoveAllBucketTargets() {
 	evnot.Lock()
 	defer evnot.Unlock()
 
-	for _, targetMap := range evnot.bucketRemoteTargetRulesMap {
-		targetIDSet := event.NewTargetIDSet()
-		for k := range targetMap {
-			targetIDSet[k] = struct{}{}
-		}
-		evnot.targetList.Remove(targetIDSet)
+	targetIDSet := event.NewTargetIDSet()
+	for k := range evnot.targetList.TargetMap() {
+		targetIDSet[k] = struct{}{}
 	}
+	evnot.targetList.Remove(targetIDSet)
 }
 
 // Send - sends the event to all registered notification targets
@@ -209,7 +147,8 @@ func (evnot *EventNotifier) Send(args eventArgs) {
 		return
 	}
 
-	evnot.targetList.Send(args.ToEvent(true), targetIDSet, evnot.targetResCh)
+	// If MINIO_API_SYNC_EVENTS is set, send events synchronously.
+	evnot.targetList.Send(args.ToEvent(true), targetIDSet, globalAPIConfig.isSyncEventsEnabled())
 }
 
 type eventArgs struct {
@@ -226,6 +165,9 @@ type eventArgs struct {
 func (args eventArgs) ToEvent(escape bool) event.Event {
 	eventTime := UTCNow()
 	uniqueID := fmt.Sprintf("%X", eventTime.UnixNano())
+	if !args.Object.ModTime.IsZero() {
+		uniqueID = fmt.Sprintf("%X", args.Object.ModTime.UnixNano())
+	}
 
 	respElements := map[string]string{
 		"x-amz-request-id": args.RespElements["requestId"],
@@ -239,7 +181,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 	}
 
 	// Add deployment as part of response elements.
-	respElements["x-minio-deployment-id"] = globalDeploymentID
+	respElements["x-minio-deployment-id"] = globalDeploymentID()
 	if args.RespElements["content-length"] != "" {
 		respElements["content-length"] = args.RespElements["content-length"]
 	}
@@ -278,13 +220,17 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 		},
 	}
 
-	if args.EventName != event.ObjectRemovedDelete && args.EventName != event.ObjectRemovedDeleteMarkerCreated {
+	isRemovedEvent := args.EventName == event.ObjectRemovedDelete ||
+		args.EventName == event.ObjectRemovedDeleteMarkerCreated ||
+		args.EventName == event.ObjectRemovedNoOP
+
+	if !isRemovedEvent {
 		newEvent.S3.Object.ETag = args.Object.ETag
 		newEvent.S3.Object.Size = args.Object.Size
 		newEvent.S3.Object.ContentType = args.Object.ContentType
 		newEvent.S3.Object.UserMetadata = make(map[string]string, len(args.Object.UserDefined))
 		for k, v := range args.Object.UserDefined {
-			if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+			if stringsHasPrefixFold(strings.ToLower(k), ReservedMetadataPrefixLower) {
 				continue
 			}
 			newEvent.S3.Object.UserMetadata[k] = v
